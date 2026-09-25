@@ -30,6 +30,65 @@ fitted。输出包含：
 `mean`、`fitted`、`total_error` 均为已约分的 `{numerator, denominator}`
 分数，分母恒为正。
 
+### 固定观测（锚点）校正
+
+经人工复测的磨损点必须原值保留，不能被平滑曲线改写。`POST
+/correct/anchored` 在 `/correct` 的基础上接受 `anchors` 字段，以唯一
+id 指定 **1～12 个锚点**；锚点的 `fitted` 以**等式约束**恒等于其
+`reading`（不是用极大有限权重近似固定），其余点仍在整条非递减曲线上
+最小化加权平方误差。
+
+锚点把序列切成独立段：首锚点左侧只有上界、相邻锚点之间同时有上下界、
+末锚点右侧只有下界。链式全序加常数界时，有界解等于无界保序解逐点
+截断到界内，因此段内复用 PAVA 再精确截断，全程仍只用整数与分数。
+
+```json
+{
+  "observations": [
+    {"id": "p1", "reading": 3, "weight": 1},
+    {"id": "p2", "reading": 1, "weight": 1},
+    {"id": "p3", "reading": 2, "weight": 1}
+  ],
+  "anchors": ["p2"]
+}
+```
+
+除 `/correct` 的全部 422 规则外，`anchors` 为空或超过 12 个、锚点 id
+重复、锚点 id 不存在于本批观测中，均返回 **422**。
+
+响应结构同 `/correct`，逐点用 `fixed` 标出固定点；分块仍为整条曲线
+上的最大连续等值段——等值跨越锚点时也合并为同一块：
+
+```json
+{
+  "blocks": [
+    {"start_index": 0, "end_index": 1,
+     "mean": {"numerator": 1, "denominator": 1}},
+    {"start_index": 2, "end_index": 2,
+     "mean": {"numerator": 2, "denominator": 1}}
+  ],
+  "fitted": [
+    {"id": "p1", "fitted": {"numerator": 1, "denominator": 1}, "fixed": false},
+    {"id": "p2", "fitted": {"numerator": 1, "denominator": 1}, "fixed": true},
+    {"id": "p3", "fitted": {"numerator": 2, "denominator": 1}, "fixed": false}
+  ],
+  "total_error": {"numerator": 4, "denominator": 1}
+}
+```
+
+锚点读数按观测顺序必须非递减（等值允许）。若出现下降，等式约束与非
+递减曲线不可兼得，返回 **409** 与最早冲突的一对相邻锚点 id，不发布
+任何部分拟合：
+
+```json
+{
+  "detail": {
+    "code": "INFEASIBLE_ANCHORS",
+    "conflict": ["p1", "p2"]
+  }
+}
+```
+
 ## 接口
 
 `POST /correct`，普通 JSON：
@@ -101,11 +160,12 @@ python3.12 -m venv .venv
 
 ```
 app/
-  isotonic.py   # 纯整数/分数 PAVA 领域算法（无 float）
+  isotonic.py   # 纯整数/分数 PAVA 与锚点有界拟合（无 float）
   schemas.py    # pydantic 请求/响应模型与 422 校验
-  main.py       # FastAPI 路由
+  main.py       # FastAPI 路由（/correct、/correct/anchored、/health）
 tests/
   test_isotonic.py  # 领域算法测试
+  test_anchored.py  # 固定观测校正测试
   test_http.py      # HTTP 测试
   oracle.py         # 枚举全部连续分区（2^(n-1) 种）的精确神谕
 pytest.ini / Dockerfile / docker-compose.yml
@@ -123,5 +183,12 @@ pytest.ini / Dockerfile / docker-compose.yml
   分数**、并列合并（最粗规范分块）、5000 点规模、重复调用确定性。
 - 无浮点保证：字节码常量扫描 + AST 检查（无 float 常量、无 `/`
   真除法、无 `float` 内建）。
+- 固定观测校正：短序列上用**独立有理数候选枚举**核对最优性——枚举
+  全部连续分区、块值取 clip(加权均值, 下界, 上界) 的全部可行候选
+  （另有一个不做段分解、不用截断性质的整序列暴力神谕交叉核对段分解
+  假设）；覆盖相等锚点、端点锚点、全固定、跨锚点等值单分块、锚点
+  精确固定（非大权重近似）、空锚点与普通拟合逐项一致、最早冲突对
+  报告，以及冲突后 `/correct` 与修正后的锚点请求仍可正常调用。
 - HTTP：200 响应结构与精确数值、未知字段/重复 id/越界/类型错误/错误
-  媒体类型/畸形 JSON 一律 422、2 与 5000 个点的边界。
+  媒体类型/畸形 JSON 一律 422、未知或重复锚点 422、锚点下降 409
+  （`INFEASIBLE_ANCHORS`）、2 与 5000 个点的边界。
