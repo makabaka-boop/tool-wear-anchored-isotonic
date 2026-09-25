@@ -5,18 +5,29 @@
 * 每项有唯一 ASCII ``id``、整数 ``reading`` ∈ [0, 10^9]、
   整数 ``weight`` ∈ [1, 10^6]；
 * 未知字段、重复 id、越界值、类型错误一律令整次请求返回 422。
+
+固定观测校正（``/correct/anchored``）在此基础上额外接受 1 至 12 个
+锚点 id；锚点 id 重复或指向不存在的观测同样按原校验契约返回 422。
 """
 
 from __future__ import annotations
 
 from typing import List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 MAX_OBSERVATIONS = 5000
 MIN_OBSERVATIONS = 2
 MAX_READING = 10**9
 MAX_WEIGHT = 10**6
+MIN_ANCHORS = 1
+MAX_ANCHORS = 12
 
 
 class Observation(BaseModel):
@@ -66,7 +77,12 @@ class FractionModel(BaseModel):
 
 
 class BlockModel(BaseModel):
-    """连续合并块：含端点的 0 基索引与块加权均值。"""
+    """最大连续等值分块：含端点的 0 基索引与块内公共 fitted 值。
+
+    无锚点校正中等值块即 PAVA 合并块，``mean`` 为块内加权均值；
+    固定观测校正中 ``mean`` 为该等值块的公共 fitted 值（可能因
+    锚点或常数界裁剪而不同于块内读数的加权均值）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -91,4 +107,52 @@ class CorrectionResponse(BaseModel):
 
     blocks: List[BlockModel]
     fitted: List[FittedPoint]
+    total_error: FractionModel
+
+
+class AnchoredCorrectionRequest(CorrectionRequest):
+    """固定观测校正请求：整批观测之外，指定 1 至 12 个锚点 id。
+
+    锚点的 fitted 被固定为其 reading。锚点 id 重复或指向不存在的
+    观测时，与原有校验失败一样整次请求返回 422。
+    """
+
+    anchors: List[str] = Field(min_length=MIN_ANCHORS, max_length=MAX_ANCHORS)
+
+    @field_validator("anchors")
+    @classmethod
+    def _unique_anchor_ids(cls, value: List[str]) -> List[str]:
+        seen: set[str] = set()
+        for item in value:
+            if item in seen:
+                raise ValueError(f"duplicate anchor id: {item!r}")
+            seen.add(item)
+        return value
+
+    @model_validator(mode="after")
+    def _anchors_must_exist(self) -> "AnchoredCorrectionRequest":
+        known = {item.id for item in self.observations}
+        for anchor in self.anchors:
+            if anchor not in known:
+                raise ValueError(f"unknown anchor id: {anchor!r}")
+        return self
+
+
+class AnchoredFittedPoint(BaseModel):
+    """逐点拟合结果，并明确标出该点是否为固定观测（锚点）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    fitted: FractionModel
+    fixed: bool
+
+
+class AnchoredCorrectionResponse(BaseModel):
+    """固定观测校正结果：分块为最大连续等值块（等值跨锚点也合并）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    blocks: List[BlockModel]
+    fitted: List[AnchoredFittedPoint]
     total_error: FractionModel

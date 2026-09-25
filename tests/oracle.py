@@ -88,3 +88,79 @@ def oracle_best_partition(
 
     assert best_ranges is not None
     return best_ranges, best_error
+
+
+def oracle_anchored_fit(
+    readings: Sequence[int], weights: Sequence[int], anchor_indices: Sequence[int]
+) -> Tuple[List[Fraction], Fraction]:
+    """固定观测保序回归的独立神谕：有理数候选枚举 + 单调序列 DP。
+
+    最优 fitted 的每个取值必为某区间的加权均值（无界块的均值，或锚点
+    读数即单点区间均值），故候选值集合有限：全部 O(n^2) 个区间加权均值。
+    在候选值上枚举非递减序列（锚点位置只允许取其读数），用 DP 精确求得
+    最小加权平方误差。目标关于 fitted 严格凸（权重为正），最优 fitted
+    唯一，因此可直接与求解器逐点对比。
+
+    仅用于可行输入（锚点读数按加工顺序非递减）；返回（逐点 fitted,
+    最小总误差）。
+    """
+
+    n = len(readings)
+    anchors = set(anchor_indices)
+
+    candidates = set()
+    for u in range(n):
+        sum_w = 0
+        sum_wr = 0
+        for v in range(u, n):
+            sum_w += weights[v]
+            sum_wr += weights[v] * readings[v]
+            candidates.add(Fraction(sum_wr, sum_w))
+    levels = sorted(candidates)
+    m = len(levels)
+
+    # dp[j]：处理到第 i 个点且 f_i = levels[j] 时的最小误差；
+    # choice 记录最优前驱下标用于回溯。None 表示不可达。
+    dp: List[Fraction | None] = [None] * m
+    choices: List[List[int]] = []
+    for i in range(n):
+        row: List[Fraction | None] = [None] * m
+        row_choice = [-1] * m
+        for j in range(m):
+            value = levels[j]
+            if i in anchors and value != readings[i]:
+                continue
+            cost = weights[i] * (value - readings[i]) ** 2
+            if i == 0:
+                row[j] = cost
+                continue
+            best_prev: Fraction | None = None
+            best_j = -1
+            for jp in range(m):
+                if levels[jp] > value:
+                    break
+                if dp[jp] is None:
+                    continue
+                if best_prev is None or dp[jp] < best_prev:
+                    best_prev = dp[jp]
+                    best_j = jp
+            if best_prev is not None:
+                row[j] = best_prev + cost
+                row_choice[j] = best_j
+        dp = row
+        choices.append(row_choice)
+
+    best_total: Fraction | None = None
+    best_j = -1
+    for j in range(m):
+        if dp[j] is not None and (best_total is None or dp[j] < best_total):
+            best_total = dp[j]
+            best_j = j
+    assert best_total is not None, "infeasible anchor configuration"
+
+    fitted = [Fraction(0, 1)] * n
+    j = best_j
+    for i in range(n - 1, -1, -1):
+        fitted[i] = levels[j]
+        j = choices[i][j]
+    return fitted, best_total
